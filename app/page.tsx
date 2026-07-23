@@ -99,30 +99,6 @@ export default function Home() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
 
-// ========== 新增：页面挂载拉取项目（带3秒超时容错） ==========
-  useEffect(() => {
-    const fetchProjects = async () => {
-      try {
-        // 接口3秒超时，卡死直接抛出异常
-        const res = await Promise.race([
-          fetch("/api/project/list"),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("请求超时")), 3000))
-        ]);
-        const data = await res.json();
-        setProjects(data);
-      } catch (err) {
-        console.error("加载历史项目失败，跳过：", err);
-        setProjects([]);
-      } finally {
-        // 无论成功失败，都关闭侧边栏加载转圈
-        setProjectsLoading(false);
-      }
-    };
-    fetchProjects();
-  }, []);
-  // ======================================================================
-
-
 
 
 
