@@ -42,12 +42,17 @@ export interface ProjectIndex {
  * on every write; the latest record is the current value.
  */
 async function pStoreGet(store: any, key: string): Promise<any> {
-  const messages = await store.getMessages({ conversationId: key, limit: 1, order: 'desc' });
-  if (messages.length > 0 && messages[0].content) {
-    const content = messages[0].content;
-    return typeof content === 'string' ? JSON.parse(content) : content;
+  try {
+    const messages = await store.getMessages({ conversationId: key, limit: 1, order: 'desc' });
+    if (messages.length > 0 && messages[0].content) {
+      const content = messages[0].content;
+      return typeof content === 'string' ? JSON.parse(content) : content;
+    }
+    return null;
+  } catch (e: any) {
+    logger.error(`pStoreGet 读取存储失败 key=${key}:`, e?.message);
+    return null;
   }
-  return null;
 }
 
 /**
@@ -56,12 +61,16 @@ async function pStoreGet(store: any, key: string): Promise<any> {
  * while older records remain as audit history.
  */
 async function pStoreSet(store: any, key: string, data: unknown, metadataType?: string): Promise<void> {
-  await store.appendMessage({
-    conversationId: key,
-    role: 'system',
-    content: JSON.stringify(data),
-    ...(metadataType ? { metadata: { type: metadataType, ts: new Date().toISOString() } } : {}),
-  });
+  try {
+    await store.appendMessage({
+      conversationId: key,
+      role: 'system',
+      content: JSON.stringify(data),
+      ...(metadataType ? { metadata: { type: metadataType, ts: new Date().toISOString() } } : {}),
+    });
+  } catch (e: any) {
+    logger.error(`pStoreSet 写入存储失败 key=${key}:`, e?.message);
+  }
 }
 
 // ─── High-level operations ───────────────────────────────────────────────────
