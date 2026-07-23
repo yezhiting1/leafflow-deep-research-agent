@@ -83,10 +83,22 @@ async function* streamChat(
 ): AsyncGenerator<string> {
   ensureProvider(context.env);
 
+  // 核心修复：捕获模型初始化异常，避免容器崩溃
+  let chatModel;
+  try {
+    chatModel = getModel(context.env);
+  } catch (modelErr) {
+    logger.error("腾讯云容器：聊天模型初始化失败", modelErr);
+    yield sseEvent({ type: 'error_message', content: '大模型接口连接失败，暂时无法进行对话，页面可正常浏览' });
+    yield sseEvent({ type: 'chat_done' });
+    yield "data: [DONE]\n\n";
+    return;
+  }
+
   const agent = new Agent({
     name: "research-chat",
     instructions: buildChatSystemPrompt(report),
-    model: getModel(context.env),
+    model: chatModel,
     tools: [],
     modelSettings: {
       maxTokens: 4096,
@@ -117,8 +129,8 @@ async function* streamChat(
         const data = (event as any).data;
         if (data?.type === 'output_text_delta' && data.delta) {
           const text = data.delta;
-          // Skip <think> blocks
-          if (!text.includes('<think>') && !text.includes('</think>')) {
+          // Skip  blocks
+          if (!text.includes('') && !text.includes('')) {
             response += text;
             // Don't stream the [SUGGEST_REGENERATE] or [SUGGEST_ADD_SOURCE] markers to the user
             if (!text.includes('[SUGGEST_REGENERATE]') && !text.includes('[SUGGEST_ADD_SOURCE]')) {
@@ -135,7 +147,7 @@ async function* streamChat(
     if (!response) {
       const output = result.finalOutput;
       if (typeof output === 'string' && output) {
-        response = output.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        response = output.replace(/[\s\S]*?<\/think>/g, '').trim();
         const cleanResponse = response.replace('[SUGGEST_REGENERATE]', '').trim();
         if (cleanResponse) {
           yield sseEvent({ type: 'chat_response', content: cleanResponse });
@@ -176,23 +188,35 @@ async function* streamChat(
 // ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 export async function onRequest(context: any) {
-  const { request } = context;
-  const body = request?.body ?? {};
-  const { message, chatHistory = [], report = '' } = body;
+  // 全局兜底捕获所有异常，防止腾讯云容器进程崩溃返回502
+  try {
+    const { request } = context;
+    const body = request?.body ?? {};
+    const { message, chatHistory = [], report = '' } = body;
 
-  if (!message) {
-    return new Response(JSON.stringify({ error: 'Missing message' }), {
-      status: 400, headers: { 'Content-Type': 'application/json' },
-    });
+    if (!message) {
+      return new Response(JSON.stringify({ error: 'Missing message' }), {
+        status: 400, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (!report) {
+      return new Response(JSON.stringify({ error: 'Missing report context' }), {
+        status: 400, headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const signal = request?.signal as AbortSignal | undefined;
+    const generator = streamChat(message, chatHistory, report, signal);
+    return createSSEResponse(generator, signal);
+  } catch (globalErr) {
+    logger.error("全局捕获聊天接口异常，容器未崩溃：", globalErr);
+    // 返回标准SSE错误流，页面正常渲染不卡死转圈
+    async function* errorStream() {
+      yield sseEvent({ type: 'error_message', content: `对话服务异常：${globalErr.message}，页面可正常浏览` });
+      yield sseEvent({ type: 'chat_done' });
+      yield "data: [DONE]\n\n";
+    }
+    return createSSEResponse(errorStream(), context.request?.signal);
   }
-
-  if (!report) {
-    return new Response(JSON.stringify({ error: 'Missing report context' }), {
-      status: 400, headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  const signal = request?.signal as AbortSignal | undefined;
-  const generator = streamChat(message, chatHistory, report, signal);
-  return createSSEResponse(generator, signal);
 }
