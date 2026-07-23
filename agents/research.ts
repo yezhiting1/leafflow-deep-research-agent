@@ -74,6 +74,16 @@ async function* streamResearch(
     yield sseEvent({ type: 'subagent_lifecycle', status: 'pending', agent: 'question-decomposer', id: 'stage-1' });
     yield sseEvent({ type: 'subagent_lifecycle', status: 'running', agent: 'question-decomposer', id: 'stage-1' });
 
+    let decomposeModel;
+    try {
+      decomposeModel = getModel(context.env);
+    } catch (modelErr) {
+      logger.error("腾讯云容器：初始化分解问题模型失败", modelErr);
+      yield sseEvent({ type: 'error_message', content: '大模型接口连接失败，无法拆分研究问题，页面可正常浏览' });
+      yield 'data: [DONE]\n\n';
+      return;
+    }
+
     const decomposeAgent = new Agent({
       name: 'question-decomposer',
       instructions: `You are a research question decomposer. Break the given research question into focused sub-questions.
@@ -84,7 +94,7 @@ Generate ${depth === 'quick' ? '2-3' : depth === 'deep' ? '5-7' : '3-5'} sub-que
 - Future directions and applications
 Write sub-questions in the same language as the input question.
 Call the decompose_question tool with your generated sub-questions.`,
-      model: getModel(context.env),
+      model: decomposeModel,
       tools: [decomposeQuestion],
       modelSettings: { maxTokens: 2048 },
     });
@@ -148,10 +158,20 @@ Call the decompose_question tool with your generated sub-questions.`,
     tools.push(scrapeUrls as any);
   }
 
+  let mainAgentModel;
+  try {
+    mainAgentModel = getModel(context.env);
+  } catch (modelErr) {
+    logger.error("腾讯云容器：初始化主研究模型失败", modelErr);
+    yield sseEvent({ type: 'error_message', content: '大模型接口连接失败，无法执行完整研究流程，页面可正常加载' });
+    yield 'data: [DONE]\n\n';
+    return;
+  }
+
   const agent = new Agent({
     name: 'deep-research',
     instructions: buildSystemPrompt(opts),
-    model: getModel(context.env),
+    model: mainAgentModel,
     tools,
     modelSettings: { maxTokens: 65536 },
   });
@@ -254,8 +274,8 @@ Call the decompose_question tool with your generated sub-questions.`,
         const data = (event as any).data;
         if (data?.type === 'output_text_delta' && data.delta) {
           const text = data.delta;
-          // Skip <think> blocks
-          if (!text.includes('<think>') && !text.includes('</think>')) {
+          // Skip  blocks
+          if (!text.includes('') && !text.includes('')) {
             // Only emit as report if all tools have completed
             if (allToolsDone) {
               if (!synthesizing) {
@@ -311,7 +331,7 @@ Call the decompose_question tool with your generated sub-questions.`,
     if (!report) {
       const output = result.finalOutput;
       if (typeof output === 'string' && output) {
-        report = output.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        report = output.replace(/[\s\S]*?<\/think>/g, '').trim();
         if (report) {
           if (!synthesizing) {
             yield sseEvent({ type: 'subagent_lifecycle', status: 'running', agent: 'synthesizer', id: 'stage-4' });
@@ -372,11 +392,19 @@ Call the decompose_question tool with your generated sub-questions.`,
 
     logger.log(`Report incomplete (attempt ${attempt + 1}/${MAX_CONTINUATIONS}, len=${report.length}, hasConclusion=${hasConclusion}). Continuing...`);
 
+    let continueModel;
+    try {
+      continueModel = getModel(context.env);
+    } catch (modelErr) {
+      logger.error("腾讯云容器：续写报告模型初始化失败，终止续写", modelErr);
+      break;
+    }
+
     try {
       const continueAgent = new Agent({
         name: 'report-continuator',
         instructions: `You are continuing an incomplete research report. The previous output was cut short. Continue writing from EXACTLY where it left off — do NOT add any prefix, greeting, or "continued from" note. Do NOT repeat any content that already exists. Complete ALL remaining sections following this exact structure: main body chapters → ## 结论 (or ## Conclusion). Do NOT write a references / 参考文献 section — the application generates it automatically. Keep all inline [n] citation numbers as-is; do NOT invent new numbers. Write in the same language as the existing content. Output ONLY the continuation text. Write as MUCH content as possible — aim for at least 2000 characters.`,
-        model: getModel(context.env),
+        model: continueModel,
         tools: [],
         modelSettings: { maxTokens: 65536 },
       });
@@ -396,7 +424,7 @@ Call the decompose_question tool with your generated sub-questions.`,
           const data = (event as any).data;
           if (data?.type === 'output_text_delta' && data.delta) {
             const text = data.delta;
-            if (!text.includes('<think>') && !text.includes('</think>')) {
+            if (!text.includes('') && !text.includes('')) {
               continuation += text;
               report += text;
               yield sseEvent({ type: 'ai_response', content: text, agent: 'synthesizer' });
@@ -477,54 +505,65 @@ Call the decompose_question tool with your generated sub-questions.`,
 // ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 export async function onRequest(context: any) {
-  const { request } = context;
-  const body = request?.body ?? {};
-  const { message, question: questionField, depth = 'standard', projectId, urls, confirmedSubQuestions, decomposeOnly, locale, citationStyle } = body;
-  const question = message || questionField || '';
+  // 全局兜底捕获所有异常，防止腾讯云容器进程崩溃502
+  try {
+    const { request } = context;
+    const body = request?.body ?? {};
+    const { message, question: questionField, depth = 'standard', projectId, urls, confirmedSubQuestions, decomposeOnly, locale, citationStyle } = body;
+    const question = message || questionField || '';
 
-  if (!question) {
-    return new Response(JSON.stringify({ error: 'Missing research question' }), {
-      status: 400, headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  // Load previous report context if this is a follow-up in a project
-  let previousReport: string | undefined;
-  let previousPapers: any[] = [];
-  let previousArticles: any[] = [];
-  let previousScrapedUrls: any[] = [];
-  let previousSubQuestions: string[] = [];
-  let isFollowUp = false;
-
-  if (projectId && context.store) {
-    const last = await getLastVersionFromStore(context.store, projectId);
-    if (last && last.version?.report) {
-      isFollowUp = true;
-      previousReport = last.version.report;
-      previousPapers = Array.isArray(last.version.papers) ? last.version.papers : [];
-      previousArticles = Array.isArray(last.version.articles) ? last.version.articles : [];
-      previousScrapedUrls = Array.isArray(last.version.scrapedUrls) ? last.version.scrapedUrls : [];
-      previousSubQuestions = Array.isArray(last.version.subQuestions) ? last.version.subQuestions : [];
-      logger.log(`Loaded follow-up context: report=${previousReport!.length}chars papers=${previousPapers.length} articles=${previousArticles.length} scraped=${previousScrapedUrls.length} subQs=${previousSubQuestions.length}`);
+    if (!question) {
+      return new Response(JSON.stringify({ error: 'Missing research question' }), {
+        status: 400, headers: { 'Content-Type': 'application/json' },
+      });
     }
-  }
 
-  const signal = request?.signal as AbortSignal | undefined;
-  const opts: ResearchOptions = {
-    depth,
-    projectId,
-    urls: Array.isArray(urls) ? urls.filter((u: any) => typeof u === 'string' && u.startsWith('http')) : undefined,
-    previousReport,
-    previousPapers,
-    previousArticles,
-    previousScrapedUrls,
-    previousSubQuestions,
-    isFollowUp,
-    confirmedSubQuestions: Array.isArray(confirmedSubQuestions) ? confirmedSubQuestions : undefined,
-    decomposeOnly: !!decomposeOnly,
-    locale,
-    citationStyle,
-  };
-  const generator = streamResearch(question, opts, context, signal);
-  return createSSEResponse(generator, signal);
+    // Load previous report context if this is a follow-up in a project
+    let previousReport: string | undefined;
+    let previousPapers: any[] = [];
+    let previousArticles: any[] = [];
+    let previousScrapedUrls: any[] = [];
+    let previousSubQuestions: string[] = [];
+    let isFollowUp = false;
+
+    if (projectId && context.store) {
+      const last = await getLastVersionFromStore(context.store, projectId);
+      if (last && last.version?.report) {
+        isFollowUp = true;
+        previousReport = last.version.report;
+        previousPapers = Array.isArray(last.version.papers) ? last.version.papers : [];
+        previousArticles = Array.isArray(last.version.articles) ? last.version.articles : [];
+        previousScrapedUrls = Array.isArray(last.version.scrapedUrls) ? last.version.scrapedUrls : [];
+        previousSubQuestions = Array.isArray(last.version.subQuestions) ? last.version.subQuestions : [];
+        logger.log(`Loaded follow-up context: report=${previousReport!.length}chars papers=${previousPapers.length} articles=${previousArticles.length} scraped=${previousScrapedUrls.length} subQs=${previousSubQuestions.length}`);
+      }
+    }
+
+    const signal = request?.signal as AbortSignal | undefined;
+    const opts: ResearchOptions = {
+      depth,
+      projectId,
+      urls: Array.isArray(urls) ? urls.filter((u: any) => typeof u === 'string' && u.startsWith('http')) : undefined,
+      previousReport,
+      previousPapers,
+      previousArticles,
+      previousScrapedUrls,
+      previousSubQuestions,
+      isFollowUp,
+      confirmedSubQuestions: Array.isArray(confirmedSubQuestions) ? confirmedSubQuestions : undefined,
+      decomposeOnly: !!decomposeOnly,
+      locale,
+      citationStyle,
+    };
+    const generator = streamResearch(question, opts, context, signal);
+    return createSSEResponse(generator, signal);
+  } catch (globalErr) {
+    logger.error("全局捕获服务运行异常，容器未崩溃：", globalErr);
+    // 返回标准SSE错误流，页面正常渲染不卡死转圈
+    async function* errorStream() {
+      yield sseEvent({ type: 'error_message', content: `运行提示：${globalErr.message}，页面可正常浏览，无法执行研究功能` });
+      yield 'data: [DONE]\n\n';
+    }
+    return createSSEResponse(errorStream(), context.request?.signal);
+  }
 }
